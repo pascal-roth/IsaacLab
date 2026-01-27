@@ -17,7 +17,8 @@ from packaging import version
 
 import carb
 import omni.usd
-from pxr import Sdf, UsdGeom
+from isaacsim.core.simulation_manager import SimulationManager
+from pxr import Sdf, UsdGeom, UsdPhysics
 
 import isaaclab.sim as sim_utils
 import isaaclab.utils.sensors as sensor_utils
@@ -27,7 +28,9 @@ from isaaclab.utils.array import convert_to_torch
 from isaaclab.utils.math import (
     convert_camera_frame_orientation_convention,
     create_rotation_matrix_from_view,
+    quat_apply,
     quat_from_matrix,
+    quat_mul,
 )
 from isaaclab.utils.version import get_isaac_sim_version
 
@@ -387,6 +390,11 @@ class Camera(SensorBase):
         This function creates handles and registers the provided data types with the replicator registry to
         be able to access the data from the sensor. It also initializes the internal buffers to store the data.
 
+        This method detects if the camera is attached to a rigid body or articulation for optimized pose queries.
+        - If the target prim path is a rigid body or articulation link, build the view directly on it.
+        - Otherwise find the closest rigid-body or articulation ancestor, cache the fixed transform from that ancestor
+          to the target prim, and build the view on the ancestor expression.
+
         Raises:
             RuntimeError: If the number of camera prims in the view does not match the number of environments.
             RuntimeError: If replicator was not found.
@@ -403,10 +411,54 @@ class Camera(SensorBase):
 
         # Initialize parent class
         super()._initialize_impl()
-        # Create a view for the sensor with Fabric enabled for fast pose querie, otherwise position will be staling
-        self._view = XformPrimView(
-            self.cfg.prim_path, device=self._device, stage=self.stage, sync_usd_on_fabric_write=True
+        
+        # Detect if camera is attached to a rigid body or articulation for optimized queries
+        # Check the first camera prim to determine view type
+        prim = sim_utils.find_first_matching_prim(self.cfg.prim_path)
+        if prim is None:
+            raise RuntimeError(f"Failed to find a prim at path expression: {self.cfg.prim_path}")
+
+        # Find the first matching ancestor prim that implements rigid body API
+        ancestor_prim = sim_utils.get_first_matching_ancestor_prim(
+            prim.GetPath(), predicate=lambda _prim: _prim.HasAPI(UsdPhysics.RigidBodyAPI)
         )
+        
+        # Determine the view type and compute fixed offset if needed
+        if ancestor_prim is not None:
+            # We found a rigid body ancestor - use physics view for better performance
+            self._physics_sim_view = SimulationManager.get_physics_sim_view()
+            
+            if ancestor_prim == prim:
+                # Camera is directly on a rigid body
+                self._rigid_parent_expr = self.cfg.prim_path
+                fixed_pos_b, fixed_quat_b = None, None
+            else:
+                # Camera is a child of a rigid body - compute fixed offset
+                relative_path = prim.GetPath().MakeRelativePath(ancestor_prim.GetPath()).pathString
+                self._rigid_parent_expr = self.cfg.prim_path.replace(relative_path, "")
+                # Resolve the relative pose between the target prim and the ancestor prim
+                fixed_pos_b, fixed_quat_b = sim_utils.resolve_prim_pose(prim, ancestor_prim)
+            
+            # Create the rigid body view on the ancestor
+            self._view = self._physics_sim_view.create_rigid_body_view(self._rigid_parent_expr.replace(".*", "*"))
+            self._use_rigid_body_view = True
+            
+            # Store fixed offset for later composition with configured offset
+            if fixed_pos_b is not None and fixed_quat_b is not None:
+                self._fixed_offset_pos_b = torch.tensor(fixed_pos_b, device=self._device)
+                self._fixed_offset_quat_b = torch.tensor(fixed_quat_b, device=self._device)
+            else:
+                self._fixed_offset_pos_b = None
+                self._fixed_offset_quat_b = None
+        else:
+            # No rigid body ancestor - fall back to XformPrimView
+            self._view = XformPrimView(
+                self.cfg.prim_path, device=self._device, stage=self.stage, sync_usd_on_fabric_write=True
+            )
+            self._use_rigid_body_view = False
+            self._fixed_offset_pos_b = None
+            self._fixed_offset_quat_b = None
+        
         # Check that sizes are correct
         if self._view.count != self._num_envs:
             raise RuntimeError(
@@ -421,15 +473,23 @@ class Camera(SensorBase):
 
         # Attach the sensor data types to render node
         self._render_product_paths: list[str] = list()
-        self._rep_registry: dict[str, list[rep.annotators.Annotator]] = {name: list() for name in self.cfg.data_types}
+        self._rep_registry: dict[str, list[rep.annotators.Annotator]] = (
+            {name: list() for name in self.cfg.data_types}
+        )
+
+        # Get all camera prims directly from the original prim path
+        # (not from the view, which might be on a rigid body ancestor)
+        camera_prims = sim_utils.find_matching_prims(self.cfg.prim_path)
 
         # Convert all encapsulated prims to Camera
-        for cam_prim in self._view.prims:
+        for cam_prim in camera_prims:
             # Obtain the prim path
             cam_prim_path = cam_prim.GetPath().pathString
             # Check if prim is a camera
             if not cam_prim.IsA(UsdGeom.Camera):
-                raise RuntimeError(f"Prim at path '{cam_prim_path}' is not a Camera.")
+                raise RuntimeError(
+                    f"Prim at path '{cam_prim_path}' is not a Camera."
+                )
             # Add to list
             sensor_prim = UsdGeom.Camera(cam_prim)
             self._sensor_prims.append(sensor_prim)
@@ -605,23 +665,60 @@ class Camera(SensorBase):
             self._data.intrinsic_matrices[i, 2, 2] = 1
 
     def _update_poses(self, env_ids: Sequence[int]):
-        """Computes the pose of the camera in the world frame with ROS convention.
+        """Computes the pose of the camera in the world frame.
 
-        This methods uses the ROS convention to resolve the input pose. In this convention,
-        we assume that the camera front-axis is +Z-axis and up-axis is -Y-axis.
+        This methods uses the ROS convention to resolve the input pose. In this
+        convention, we assume that the camera front-axis is +Z-axis and up-axis
+        is -Y-axis.
+
+        If the camera is attached to a rigid body, this method applies any
+        fixed offset from the rigid body frame to the camera frame.
 
         Returns:
             A tuple of the position (in meters) and quaternion (w, x, y, z).
         """
         # check camera prim exists
         if len(self._sensor_prims) == 0:
-            raise RuntimeError("Camera prim is None. Please call 'sim.play()' first.")
+            raise RuntimeError(
+                "Camera prim is None. Please call 'sim.play()' first."
+            )
 
-        # get the poses from the view
-        poses, quat = self._view.get_world_poses(env_ids)
-        self._data.pos_w[env_ids] = poses
-        self._data.quat_w_world[env_ids] = convert_camera_frame_orientation_convention(
-            quat, origin="opengl", target="world"
+        # Get poses based on view type
+        if self._use_rigid_body_view:
+            # Use rigid body view for optimized queries
+            pos_w, quat_w = self._view.get_transforms()[env_ids].split(
+                [3, 4], dim=-1
+            )
+            # Convert quaternion from xyzw to wxyz
+            quat_w = quat_w.roll(1, dims=-1)
+
+            # Apply fixed offset if camera is not directly on rigid body
+            if (
+                self._fixed_offset_pos_b is not None
+                and self._fixed_offset_quat_b is not None
+            ):
+                # Broadcast fixed offset across selected environments
+                fixed_pos_b = self._fixed_offset_pos_b.unsqueeze(
+                    0
+                ).expand(len(env_ids), -1)
+                fixed_quat_b = self._fixed_offset_quat_b.unsqueeze(
+                    0
+                ).expand(len(env_ids), -1)
+
+                # Apply offset: pos_camera = pos_rigid + R_rigid * offset_pos
+                pos_w = pos_w + quat_apply(quat_w, fixed_pos_b)
+                # Apply offset: quat_camera = quat_rigid * offset_quat
+                quat_w = quat_mul(quat_w, fixed_quat_b)
+        else:
+            # Use XformPrimView (standard path)
+            pos_w, quat_w = self._view.get_world_poses(env_ids)
+
+        # Store poses
+        self._data.pos_w[env_ids] = pos_w
+        self._data.quat_w_world[env_ids] = (
+            convert_camera_frame_orientation_convention(
+                quat_w, origin="opengl", target="world"
+            )
         )
 
     def _create_annotator_data(self):
