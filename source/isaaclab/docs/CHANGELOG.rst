@@ -1,6 +1,17 @@
 Changelog
 ---------
 
+4.5.23 (2026-03-20)
+~~~~~~~~~~~~~~~~~~~
+
+Fixed
+^^^^^
+
+* Fixed :meth:`~isaaclab.sim.SimulationContext.render` not calling ``app.update()`` when
+  running with Isaac Sim (Kit) and no active visualizer pumps the Kit app loop. This caused
+  ``--video`` recording to produce black frames when not using ``--viz kit``.
+
+
 4.5.22 (2026-03-16)
 ~~~~~~~~~~~~~~~~~~~
 
